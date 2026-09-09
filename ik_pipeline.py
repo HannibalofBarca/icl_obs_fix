@@ -247,11 +247,26 @@ def _anchor_correction(seed_transform: "mink.SE3", first_quat_wxyz: np.ndarray, 
 
 def _declitch_quaternions(quat_wxyz: np.ndarray, timestamp: np.ndarray) -> np.ndarray:
     """Repairs the recorded-orientation spikes described at
-    MAX_ANGULAR_VELOCITY_DEG_S's definition: flags any frame-to-frame
-    rotation exceeding that angular velocity, then replaces each contiguous
-    flagged run by SLERPing between the nearest good quaternions bracketing
-    it (held constant off the nearest good frame if the run touches either
-    end of the episode)."""
+    MAX_ANGULAR_VELOCITY_DEG_S's definition: flags any rotation from the
+    last confirmed-good frame exceeding that angular velocity, then replaces
+    each contiguous flagged run by SLERPing between the nearest good
+    quaternions bracketing it (held constant off the nearest good frame if
+    the run touches either end of the episode).
+
+    Deliberately compares each candidate frame to the last *confirmed-good*
+    frame rather than the immediately preceding raw sample: a glitch has
+    been observed held/duplicated verbatim across two or more consecutive
+    raw samples, which reads as zero velocity against the immediately
+    preceding (also-bad) sample and would otherwise slip through undetected
+    -- e.g. frame i snaps to a bad orientation, frame i+1 repeats that same
+    bad value bit-for-bit, so a prev-frame-only check flags i but not i+1,
+    and that lone undeclitched bad target is enough to derail a downstream
+    sequential warm-started IK solve for many frames afterward. Comparing
+    against the last known-good frame instead naturally propagates the flag
+    through any such held-duplicate run, since elapsed time accumulates
+    across it and a real (non-glitch) resumption of motion still measures a
+    physically plausible velocity once it's checked against that same
+    anchor."""
     n = quat_wxyz.shape[0]
     out = quat_wxyz.copy()
     if n < 2:
@@ -262,11 +277,17 @@ def _declitch_quaternions(quat_wxyz: np.ndarray, timestamp: np.ndarray) -> np.nd
     dt = np.where(dt > 1e-6, dt, np.median(good_dt) if good_dt.size else 1.0)
 
     bad = np.zeros(n, dtype=bool)
+    last_good = 0
     for i in range(1, n):
-        rel = mink.SO3(out[i - 1]).inverse().multiply(mink.SO3(out[i]))
-        deg_per_s = np.degrees(np.linalg.norm(rel.log())) / dt[i - 1]
+        elapsed = timestamp[i] - timestamp[last_good]
+        if elapsed <= 1e-6:
+            elapsed = dt[i - 1]
+        rel = mink.SO3(out[last_good]).inverse().multiply(mink.SO3(out[i]))
+        deg_per_s = np.degrees(np.linalg.norm(rel.log())) / elapsed
         if deg_per_s > MAX_ANGULAR_VELOCITY_DEG_S:
             bad[i] = True
+        else:
+            last_good = i
 
     if not bad.any():
         return out
