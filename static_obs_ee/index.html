@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ICL Obs&rarr;EE Visualizer</title>
+<link rel="stylesheet" href="style.css" />
+<script>
+  (function () {
+    var saved = localStorage.getItem("theme");
+    if (saved === "light") document.documentElement.setAttribute("data-theme", "light");
+  })();
+</script>
+</head>
+<body>
+
+<header id="topbar">
+  <div class="tb-group">
+    <label class="tb-label">Task</label>
+    <select id="taskSelect"><option value="">Loading tasks…</option></select>
+  </div>
+
+  <div class="tb-group">
+    <label class="tb-label">Episode</label>
+    <input id="episodeInput" type="number" min="1" value="1" />
+    <span id="posLabel" class="tb-static">– / –</span>
+    <button id="prevBtn" class="icon-btn" title="Previous episode">◀</button>
+    <button id="nextBtn" class="icon-btn" title="Next episode">▶</button>
+  </div>
+
+  <div class="tb-group">
+    <span id="outcomeTag" class="outcome-tag">–</span>
+  </div>
+
+  <div class="tb-group tb-right">
+    <span id="statusBadge" class="status-badge">loading…</span>
+    <button id="themeToggleBtn" class="icon-btn" title="Toggle light/dark mode">🌙</button>
+  </div>
+</header>
+
+<main id="mainArea">
+  <section id="videoSection">
+    <div id="videoGrid">
+      <div class="video-panel main-panel">
+        <video id="cam-zed" muted playsinline></video>
+        <span class="cam-label">zed</span>
+      </div>
+      <div class="video-panel">
+        <video id="cam-fish0" muted playsinline></video>
+        <span class="cam-label">fish0</span>
+      </div>
+      <div class="video-panel">
+        <video id="cam-fish1" muted playsinline></video>
+        <span class="cam-label">fish1</span>
+      </div>
+    </div>
+    <div id="transportControls">
+      <button id="playBtn" class="icon-btn play-btn" title="Play / Pause">▶</button>
+      <input id="scrubber" type="range" min="0" max="1000" value="0" step="0.01" />
+      <span id="timeReadout">0:00.0 / 0:00.0</span>
+    </div>
+  </section>
+
+  <section class="chart-section" data-group="left_pos">
+    <div class="chart-header">
+      <h3>Left EE position (m)</h3>
+      <span class="hint-text">Solid = FK(observation.state) · Dashed = action.left_ee, anchor-corrected to frame 0's FK pose</span>
+    </div>
+    <svg class="jointChart" data-group="left_pos" viewBox="0 0 1000 260" preserveAspectRatio="none"></svg>
+    <div class="legend-row" id="legendLeftPos"></div>
+  </section>
+
+  <section class="chart-section" data-group="left_rot">
+    <div class="chart-header">
+      <h3>Left EE orientation (quat)</h3>
+      <span class="hint-text">Solid = FK(observation.state) · Dashed = action.left_ee, anchor-corrected to frame 0's FK pose</span>
+    </div>
+    <svg class="jointChart" data-group="left_rot" viewBox="0 0 1000 260" preserveAspectRatio="none"></svg>
+    <div class="legend-row" id="legendLeftRot"></div>
+  </section>
+
+  <section class="chart-section" data-group="right_pos">
+    <div class="chart-header">
+      <h3>Right EE position (m)</h3>
+      <span class="hint-text">Solid = FK(observation.state) · Dashed = action.right_ee, anchor-corrected to frame 0's FK pose</span>
+    </div>
+    <svg class="jointChart" data-group="right_pos" viewBox="0 0 1000 260" preserveAspectRatio="none"></svg>
+    <div class="legend-row" id="legendRightPos"></div>
+  </section>
+
+  <section class="chart-section" data-group="right_rot">
+    <div class="chart-header">
+      <h3>Right EE orientation (quat)</h3>
+      <span class="hint-text">Solid = FK(observation.state) · Dashed = action.right_ee, anchor-corrected to frame 0's FK pose</span>
+    </div>
+    <svg class="jointChart" data-group="right_rot" viewBox="0 0 1000 260" preserveAspectRatio="none"></svg>
+    <div class="legend-row" id="legendRightRot"></div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -218,6 +218,73 @@ def load_model() -> mujoco.MjModel:
     return mujoco.MjModel.from_xml_path(str(MJCF_PATH))
 
 
+# Column-name convention for a 7-dim SE3 pose, matching action.left_ee /
+# action.right_ee's own feature schema in the source dataset exactly
+# (dtype=float32, shape=[7], names=[...]) so observation.left_ee /
+# observation.right_ee slot in as directly comparable columns.
+EE_POSE_NAMES = ["qw", "qx", "qy", "qz", "x", "y", "z"]
+
+
+def compute_obs_ee(model: mujoco.MjModel, observation_state: np.ndarray) -> dict:
+    """Forward-kinematics every frame's recorded observation.state (real
+    joint encoders) through the MJCF (§9) to get each arm's end-effector
+    pose -- the FK counterpart to compute_action_q's IK. observation_state
+    is fully determined qpos already, so computing this FK itself needs no
+    iterative solve, no warm-starting, and no anchor correction.
+
+    That said, the *comparison* of this output against the raw recorded
+    action.{left,right}_ee still needs the same per-episode/per-arm SE3 bias
+    removed that compute_action_q corrects for on the IK side (§5's
+    "Important caveat") -- see align_action_to_obs, immediately below
+    _anchor_correction/_corrected_target further down this file.
+
+    observation_state: (N, 15) -> {"left_ee": (N, 7), "right_ee": (N, 7)},
+    each row qw,qx,qy,qz,x,y,z (matches EE_POSE_NAMES / action.{left,right}_ee's
+    own column convention)."""
+    n = observation_state.shape[0]
+    configuration = mink.Configuration(model)
+
+    left_ee = np.zeros((n, 7))
+    right_ee = np.zeros((n, 7))
+    for i in range(n):
+        configuration.update(build_full_qpos(model, observation_state[i]))
+        left_T = configuration.get_transform_frame_to_world("left_arm_ee", "site")
+        right_T = configuration.get_transform_frame_to_world("right_arm_ee", "site")
+        left_ee[i, 0:4] = left_T.rotation().wxyz
+        left_ee[i, 4:7] = left_T.translation()
+        right_ee[i, 0:4] = right_T.rotation().wxyz
+        right_ee[i, 4:7] = right_T.translation()
+
+    # The rotation-matrix -> quaternion conversion behind get_transform_frame_to_world
+    # (ultimately mujoco's mju_mat2Quat) picks *a* valid quaternion for each frame's
+    # matrix independently, with no guarantee of picking the same sign/hemisphere as
+    # the previous frame's -- quaternions doubly cover SO(3), so q and -q represent
+    # the identical rotation. A frame landing on the opposite hemisphere from its
+    # neighbor is a genuinely continuous rotation but reads as a sign-flip
+    # discontinuity in every raw component at once (observed directly: consecutive-
+    # frame dot product of exactly -1). This is purely a representation artifact of
+    # computing each frame independently, not a data glitch -- unlike
+    # _declitch_quaternions further down, which repairs actual bad recorded values.
+    left_ee[:, 0:4] = _enforce_quaternion_hemisphere(left_ee[:, 0:4])
+    right_ee[:, 0:4] = _enforce_quaternion_hemisphere(right_ee[:, 0:4])
+
+    return {"left_ee": left_ee, "right_ee": right_ee}
+
+
+def _enforce_quaternion_hemisphere(quat_wxyz: np.ndarray) -> np.ndarray:
+    """Flips each frame's quaternion sign to match the previous frame's
+    hemisphere whenever their dot product is negative -- q and -q represent
+    the same rotation, so this changes nothing physically, it just picks the
+    continuously-varying representative so a time series of quaternions from
+    independently-computed frames doesn't show a spurious all-components sign
+    flip. See compute_obs_ee's comment for why this is needed there."""
+    out = quat_wxyz.copy()
+    for i in range(1, out.shape[0]):
+        if np.dot(out[i - 1], out[i]) < 0:
+            out[i] = -out[i]
+    return out
+
+
 def _anchor_correction(seed_transform: "mink.SE3", first_quat_wxyz: np.ndarray, first_pos_xyz: np.ndarray) -> "mink.SE3":
     """Per-episode, per-arm rigid correction for a real calibration offset
     found in the source data: `action.left_ee`/`action.right_ee` targets
@@ -324,6 +391,30 @@ def _declitch_quaternions(quat_wxyz: np.ndarray, timestamp: np.ndarray) -> np.nd
 def _corrected_target(correction: "mink.SE3", quat_wxyz: np.ndarray, pos_xyz: np.ndarray):
     T = correction.multiply(mink.SE3.from_rotation_and_translation(mink.SO3(quat_wxyz), pos_xyz))
     return T.rotation().wxyz, T.translation()
+
+
+def align_action_to_obs(fk_ee: np.ndarray, action_ee: np.ndarray) -> np.ndarray:
+    """Removes the per-episode, per-arm constant SE3 bias between a raw
+    recorded action.{left,right}_ee stream and this MJCF's own site (the
+    same phenomenon _anchor_correction exists for on the IK side, per §5's
+    "Important caveat" -- e.g. observed directly: "pass the yellow cube"/
+    "assemble the two gears" each show a consistent ~tens-of-cm per-arm
+    Z offset between action.{left,right}_ee and the FK of that same
+    episode's observation.state). Anchors frame 0's recorded target to frame
+    0's FK'd pose -- ground truth, since observation.state is the real
+    encoders -- and applies that same rigid transform to every subsequent
+    frame, so the two streams become directly comparable (e.g. for the
+    obs-vs-action-ee visualizer).
+
+    fk_ee, action_ee: (N, 7) qw,qx,qy,qz,x,y,z -> (N, 7) corrected action_ee,
+    same convention."""
+    seed_T = mink.SE3.from_rotation_and_translation(mink.SO3(fk_ee[0, 0:4]), fk_ee[0, 4:7])
+    correction = _anchor_correction(seed_T, action_ee[0, 0:4], action_ee[0, 4:7])
+
+    out = np.zeros_like(action_ee)
+    for i in range(action_ee.shape[0]):
+        out[i, 0:4], out[i, 4:7] = _corrected_target(correction, action_ee[i, 0:4], action_ee[i, 4:7])
+    return out
 
 
 def compute_action_q(
