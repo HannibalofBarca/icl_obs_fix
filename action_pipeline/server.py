@@ -13,17 +13,20 @@ Run inside the `lerobot` conda env: `conda activate lerobot`.
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
-from ik_pipeline import REPO_ID_DEFAULT, compute_action_q, get_metadata, get_video_urls, load_episode, load_model
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from common.ik_pipeline import REPO_ID_DEFAULT, compute_action_q, get_metadata, get_video_urls, load_episode, load_model
 
-BASE_DIR = Path(__file__).parent
 STATIC_DIR = BASE_DIR / "static"
-CACHE_DIR = BASE_DIR / "output" / "action_q_cache"
+CACHE_DIR = PROJECT_ROOT / "output" / "action_q_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 

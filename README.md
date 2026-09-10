@@ -1,54 +1,79 @@
 # ICL IK Visualizer
 
-Streams episodes from a `lerobot` v2.1-format dataset
-([`adityx23/icl-dataset`](https://huggingface.co/datasets/adityx23/icl-dataset))
-and reconstructs joint-space `q_target`s from the recorded cartesian
-`action.left_ee`/`action.right_ee` states via a per-frame, warm-started
-mink IK solve (`ik_pipeline.py`).
+Two visualizers/pipelines over a `lerobot` v2.1-format dataset
+([`adityx23/icl-dataset`](https://huggingface.co/datasets/adityx23/icl-dataset)),
+both built on the shared episode streaming + mink IK/FK code in
+`common/ik_pipeline.py`:
+
+- **`action_pipeline/`** — reconstructs joint-space `q_target`s from the
+  recorded cartesian `action.left_ee`/`action.right_ee` states via a
+  per-frame, warm-started mink IK solve.
+- **`obs_ee_pipeline/`** — forward-kinematics the recorded
+  `observation.state` (real joint encoders) into per-arm end-effector poses;
+  the FK counterpart of the above, cheap enough to run synchronously with no
+  cache.
 
 ## Setup
 
 ```powershell
 conda activate lerobot   # already has lerobot, huggingface_hub, fastapi, uvicorn
-pip install mink mujoco  # added on top, for the IK solve
+pip install mink mujoco  # added on top, for the IK/FK solve
 ```
 
 ## Running
 
 ```powershell
-.\start_server.ps1
-.\start_server.ps1 -Dataset "owner/other-dataset" -Port 9000
+.\action_pipeline\start_server.ps1
+.\action_pipeline\start_server.ps1 -Dataset "owner/other-dataset" -Port 9000
+
+.\obs_ee_pipeline\start_server.ps1
+.\obs_ee_pipeline\start_server.ps1 -Dataset "owner/other-dataset" -Port 9020
 ```
 
-or directly: `python server.py --dataset adityx23/icl-dataset --port 8010`.
+or directly: `python action_pipeline/server.py --dataset adityx23/icl-dataset --port 8010`
+/ `python obs_ee_pipeline/server_obs_ee.py --dataset adityx23/icl-dataset --port 8020`.
 
 Open the printed URL, pick an episode, and the recorded joint angles plot
-immediately (no bulk dataset/video download). "Calculate action q" runs the
-IK reconstruction for that episode and caches the result to
-`output/action_q_cache/`.
+immediately (no bulk dataset/video download). In the action-pipeline
+visualizer, "Calculate action q" runs the IK reconstruction for that episode
+and caches the result to `output/action_q_cache/`.
 
 ## Regenerating the full dataset
 
-`generate_full_dataset.py` reprocesses every episode and writes a `parquet`
-with an added `action.q_target` column, sharded by
-`episode_index % num_shards` for balanced parallel runs (episode length
-varies a lot):
+`action_pipeline/generate_full_dataset.py` and
+`obs_ee_pipeline/generate_obs_ee_dataset.py` reprocess every episode and
+write a `parquet` with the added columns (`action.q_target`, or
+`observation.{left,right}_ee`), sharded by `episode_index % num_shards` for
+balanced parallel runs (episode length varies a lot):
 
 ```powershell
-python generate_full_dataset.py --shard 0 --num-shards 6   # run once per shard
-python generate_full_dataset.py --merge-stats --num-shards 6   # after all shards finish
+python action_pipeline/generate_full_dataset.py --shard 0 --num-shards 6
+python action_pipeline/generate_full_dataset.py --merge-stats --num-shards 6
+
+python obs_ee_pipeline/generate_obs_ee_dataset.py --shard 0 --num-shards 6
+python obs_ee_pipeline/generate_obs_ee_dataset.py --merge-stats --num-shards 6
 ```
 
 ## Files
 
 ```
-ik_pipeline.py                shared: episode streaming + mink IK solve
-convert_actions_to_joints.py  CLI wrapper around ik_pipeline (single episode)
-generate_full_dataset.py      full-dataset regeneration, sharded
-server.py                     FastAPI backend for the visualizer
-static/                       frontend (index.html, app.js, style.css)
-assets/yor_kin.mjcf           kinematics-only MJCF (meshes stripped)
-output/                       parquet/cache written by the CLI and server (git-ignored)
+common/ik_pipeline.py                        shared: episode streaming + mink IK/FK solve
+common/assets/yor_kin.mjcf                    kinematics-only MJCF (meshes stripped)
+
+action_pipeline/convert_actions_to_joints.py  CLI wrapper around ik_pipeline (single episode)
+action_pipeline/generate_full_dataset.py      full-dataset regeneration, sharded
+action_pipeline/server.py                     FastAPI backend for the IK visualizer
+action_pipeline/static/                       frontend (index.html, app.js, style.css)
+action_pipeline/start_server.ps1
+
+obs_ee_pipeline/convert_obs_to_ee.py          CLI wrapper around ik_pipeline (single episode)
+obs_ee_pipeline/generate_obs_ee_dataset.py    full-dataset regeneration, sharded
+obs_ee_pipeline/server_obs_ee.py              FastAPI backend for the obs->EE FK visualizer
+obs_ee_pipeline/static/                       frontend (index.html, app.js, style.css)
+obs_ee_pipeline/start_server.ps1
+
+output/                                       parquet/cache written by the CLIs and servers (git-ignored)
+logs/                                         run logs from past shard regenerations (git-ignored)
 ```
 
 ## Known data quirk: orientation glitches

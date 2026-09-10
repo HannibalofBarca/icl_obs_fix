@@ -12,12 +12,14 @@ Usage:
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from ik_pipeline import EE_POSE_NAMES, REPO_ID_DEFAULT, compute_obs_ee, load_episode, load_model
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common.ik_pipeline import EE_POSE_NAMES, REPO_ID_DEFAULT, compute_obs_ee, load_episode, load_model
 
 
 def convert_episode(repo_id: str, episode_index: int, out_path: Path) -> None:
@@ -52,7 +54,7 @@ def main():
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
-    out_path = args.out or Path(__file__).parent / "output" / f"episode_{args.episode:06d}_obs_ee.parquet"
+    out_path = args.out or Path(__file__).resolve().parent.parent / "output" / f"episode_{args.episode:06d}_obs_ee.parquet"
     convert_episode(args.repo_id, args.episode, out_path)
 
 

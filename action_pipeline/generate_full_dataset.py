@@ -1,36 +1,42 @@
 """Regenerate the entire adityx23/icl-dataset locally, in the same LeRobot
-v2.1 layout, with two new columns added to every episode's parquet:
-`observation.left_ee` / `observation.right_ee` -- the FK counterpart of
-generate_full_dataset.py's `action.q_target`, computed from the recorded
-`observation.state` (real joint encoders) via ik_pipeline.compute_obs_ee
-(see vr_teleop_ik.md §9).
+v2.1 layout, with one new column added to every episode's parquet:
+`action.q_target` — the 14-dim joint-space reconstruction (lj0..lj6, rj0..rj6)
+of that frame's `action.left_ee`/`action.right_ee` cartesian targets, via the
+mink IK procedure in vr_teleop_ik.md.
 
 Everything else is carried through unchanged: every existing parquet column,
 meta/tasks.jsonl, meta/episodes.jsonl verbatim, and meta/episodes_stats.jsonl
-with per-episode min/max/mean/std/count for the two new fields merged into
-each episode's existing stats entry. meta/info.json is copied with just the
-new features appended to "features". Videos are NOT duplicated here -- this
-output has no videos/ directory; the source dataset's videos still apply
-unchanged per episode_index (see README.md).
-
-Sharding: same modulo scheme as generate_full_dataset.py (episode_index %
-num_shards), for the same reason -- see that file's docstring. Each shard
-writes its own parquet files (no overlap, safe in parallel) plus a
-shard-local `meta/episodes_stats.partial.shard{N}-of-{M}.jsonl` (also no
-overlap). Run `--merge-stats` once after every shard finishes.
+with per-episode min/max/mean/std/count for the new field merged into each
+episode's existing stats entry. meta/info.json is copied with just the new
+feature appended to "features". Videos are NOT duplicated here — this output
+has no videos/ directory; the source dataset's videos still apply unchanged
+per episode_index (see README.md).
 
 Run inside the `lerobot` conda env: `conda activate lerobot`.
 
+Sharding: episodes are assigned to shards by `episode_index % num_shards`
+rather than contiguous ranges, so parallel shards see roughly the same mix
+of short/long episodes instead of one shard drawing a run of the dataset's
+longest episodes (this happened with contiguous ranges before — see
+generate_shard1a/b/c.log, a manual re-split of a shard that ran long).
+Each shard writes its own parquet files (no overlap, safe in parallel) plus
+a shard-local `meta/episodes_stats.partial.shard{N}-of-{M}.jsonl` (also no
+overlap). Run `--merge-stats` once after every shard finishes to combine
+those partial files plus the untouched source stats into the final
+meta/episodes_stats.jsonl -- writing that file directly per-shard would have
+each shard's full-dataset copy clobber the others' additions.
+
 Usage:
-    python generate_obs_ee_dataset.py                                   # all episodes, one process
-    python generate_obs_ee_dataset.py --shard 0 --num-shards 6          # this shard's 1/6 slice
-    python generate_obs_ee_dataset.py --merge-stats --num-shards 6      # combine after all shards finish
-    python generate_obs_ee_dataset.py --start 0 --end 50                # contiguous slice, for testing
-    python generate_obs_ee_dataset.py --out output/icl-dataset-obs-ee
+    python generate_full_dataset.py                                   # all episodes, one process
+    python generate_full_dataset.py --shard 0 --num-shards 6           # this shard's 1/6 slice
+    python generate_full_dataset.py --merge-stats --num-shards 6       # combine after all shards finish
+    python generate_full_dataset.py --start 0 --end 50                 # contiguous slice, for testing
+    python generate_full_dataset.py --out output/icl-dataset-fixed-action
 """
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -38,7 +44,10 @@ import numpy as np
 import pandas as pd
 from huggingface_hub import hf_hub_download
 
-from ik_pipeline import EE_POSE_NAMES, HUB_REVISION, REPO_ID_DEFAULT, compute_obs_ee, get_metadata, load_model
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common.ik_pipeline import HUB_REVISION, REPO_ID_DEFAULT, compute_action_q, get_metadata, load_model
+
+Q_TARGET_NAMES = [f"lj{i}" for i in range(7)] + [f"rj{i}" for i in range(7)]
 
 
 def _download_meta_file(repo_id: str, rel_path: str) -> Path:
@@ -49,7 +58,7 @@ def _prepare_meta(repo_id: str, out_dir: Path) -> dict:
     """Writes the meta files that carry over unchanged (idempotent -- safe to
     call from multiple concurrently-started shards since every shard writes
     identical bytes; only the per-shard stats need real merge handling, see
-    merge_stats). Returns the parsed info.json dict (ee-pose features added,
+    merge_stats). Returns the parsed info.json dict (q_target feature added,
     not yet written -- merge_stats writes the final info.json)."""
     (out_dir / "meta").mkdir(parents=True, exist_ok=True)
     (out_dir / "data").mkdir(parents=True, exist_ok=True)
@@ -62,12 +71,11 @@ def _prepare_meta(repo_id: str, out_dir: Path) -> dict:
 
     info_path = _download_meta_file(repo_id, "meta/info.json")
     info = json.loads(info_path.read_text())
-    for key in ("observation.left_ee", "observation.right_ee"):
-        info["features"][key] = {
-            "dtype": "float32",
-            "shape": [7],
-            "names": EE_POSE_NAMES,
-        }
+    info["features"]["action.q_target"] = {
+        "dtype": "float32",
+        "shape": [14],
+        "names": Q_TARGET_NAMES,
+    }
     return info
 
 
@@ -96,6 +104,8 @@ def generate(repo_id: str, out_dir: Path, episodes: list[int], shard_label: str)
 
     total = len(episodes)
     t0 = time.time()
+    n_left_unsolved = 0
+    n_right_unsolved = 0
     total_frames = 0
     shard_stats = []
 
@@ -106,22 +116,22 @@ def generate(repo_id: str, out_dir: Path, episodes: list[int], shard_label: str)
         df = pd.read_parquet(src_parquet)
 
         obs = np.stack(df["observation.state"].to_numpy()).astype(float)
-        result = compute_obs_ee(model, obs)
-        left_ee = result["left_ee"].astype(np.float32)
-        right_ee = result["right_ee"].astype(np.float32)
-        df["observation.left_ee"] = list(left_ee)
-        df["observation.right_ee"] = list(right_ee)
+        act_l = np.stack(df["action.left_ee"].to_numpy()).astype(float)
+        act_r = np.stack(df["action.right_ee"].to_numpy()).astype(float)
+        ts = df["timestamp"].to_numpy(dtype=float)
+
+        result = compute_action_q(model, obs, act_l, act_r, ts)
+        qtarget = np.concatenate([result["qtarget_left"], result["qtarget_right"]], axis=1).astype(np.float32)
+        df["action.q_target"] = list(qtarget)
 
         out_path = out_dir / rel_path
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(out_path)
 
-        shard_stats.append({
-            "episode_index": episode_index,
-            "left_ee_stats": _stats_for(left_ee),
-            "right_ee_stats": _stats_for(right_ee),
-        })
+        shard_stats.append({"episode_index": episode_index, "q_target_stats": _stats_for(qtarget)})
 
+        n_left_unsolved += int((~result["left_solved"]).sum())
+        n_right_unsolved += int((~result["right_solved"]).sum())
         total_frames += len(df)
 
         if (i + 1) % 25 == 0 or (i + 1) == total:
@@ -130,14 +140,15 @@ def generate(repo_id: str, out_dir: Path, episodes: list[int], shard_label: str)
             eta = (total - (i + 1)) / rate if rate > 0 else float("nan")
             print(
                 f"[shard {shard_label}] [{i + 1}/{total}] episode {episode_index} ({len(df)} frames) — "
-                f"{elapsed:6.0f}s elapsed, ~{eta:6.0f}s left, {total_frames} frames so far"
+                f"{elapsed:6.0f}s elapsed, ~{eta:6.0f}s left, "
+                f"unsolved so far: left={n_left_unsolved} right={n_right_unsolved} / {total_frames} frames"
             )
 
     partial_path = out_dir / "meta" / f"episodes_stats.partial.{shard_label}.jsonl"
     partial_path.write_text("\n".join(json.dumps(r) for r in shard_stats) + ("\n" if shard_stats else ""))
 
     print(f"[shard {shard_label}] Done. Wrote {len(episodes)} episodes to {out_dir}")
-    print(f"[shard {shard_label}] {total_frames} frames FK'd.")
+    print(f"[shard {shard_label}] Unsolved frames: left={n_left_unsolved} right={n_right_unsolved} out of {total_frames} frames")
 
 
 def merge_stats(repo_id: str, out_dir: Path) -> None:
@@ -159,14 +170,10 @@ def merge_stats(repo_id: str, out_dir: Path) -> None:
             rec = json.loads(line)
             target = stats_by_episode.get(rec["episode_index"])
             if target is not None:
-                target["stats"]["observation.left_ee"] = rec["left_ee_stats"]
-                target["stats"]["observation.right_ee"] = rec["right_ee_stats"]
+                target["stats"]["action.q_target"] = rec["q_target_stats"]
                 n_merged += 1
 
-    missing = [
-        idx for idx, rec in stats_by_episode.items()
-        if "observation.left_ee" not in rec["stats"] or "observation.right_ee" not in rec["stats"]
-    ]
+    missing = [idx for idx, rec in stats_by_episode.items() if "action.q_target" not in rec["stats"]]
 
     (out_dir / "meta" / "info.json").write_text(json.dumps(info, indent=2))
     (out_dir / "meta" / "episodes_stats.jsonl").write_text(
@@ -174,7 +181,7 @@ def merge_stats(repo_id: str, out_dir: Path) -> None:
     )
     print(f"Merged {n_merged} episode stats from {len(partial_files)} shard file(s).")
     if missing:
-        print(f"WARNING: {len(missing)} episodes have no observation.{{left,right}}_ee stats yet (shards still pending?): "
+        print(f"WARNING: {len(missing)} episodes have no action.q_target stats yet (shards still pending?): "
               f"{missing[:20]}{'...' if len(missing) > 20 else ''}")
     else:
         print("All episodes accounted for.")
@@ -183,7 +190,7 @@ def merge_stats(repo_id: str, out_dir: Path) -> None:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-id", type=str, default=REPO_ID_DEFAULT)
-    parser.add_argument("--out", type=Path, default=Path(__file__).parent / "output" / "icl-dataset-obs-ee")
+    parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent.parent / "output" / "icl-dataset-fixed-action")
     parser.add_argument("--start", type=int, default=None)
     parser.add_argument("--end", type=int, default=None)
     parser.add_argument("--shard", type=int, default=None, help="process episodes where episode_index %% num_shards == shard")

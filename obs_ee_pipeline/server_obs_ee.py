@@ -13,15 +13,17 @@ Run inside the `lerobot` conda env: `conda activate lerobot`.
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
-from ik_pipeline import REPO_ID_DEFAULT, align_action_to_obs, compute_obs_ee, get_metadata, get_video_urls, load_episode, load_model
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE_DIR.parent))
+from common.ik_pipeline import REPO_ID_DEFAULT, align_action_to_obs, compute_obs_ee, get_metadata, get_video_urls, load_episode, load_model
 
-BASE_DIR = Path(__file__).parent
-STATIC_DIR = BASE_DIR / "static_obs_ee"
+STATIC_DIR = BASE_DIR / "static"
 
 
 def _parse_cli_args():
