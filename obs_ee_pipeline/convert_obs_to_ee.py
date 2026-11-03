@@ -19,16 +19,17 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from common.ik_pipeline import EE_POSE_NAMES, REPO_ID_DEFAULT, compute_obs_ee, load_episode, load_model
+from common.ik_pipeline import REPO_ID_DEFAULT, compute_obs_ee, ee_pose_names, load_episode, load_model
 
 
-def convert_episode(repo_id: str, episode_index: int, out_path: Path) -> None:
+def convert_episode(repo_id: str, episode_index: int, out_path: Path, rotation: str) -> None:
     ep = load_episode(repo_id, episode_index)
     n = ep["observation_state"].shape[0]
     print(f"Loaded episode {episode_index}: {n} rows (task={ep['task']!r}, success={ep['success']})")
 
     model = load_model()
-    result = compute_obs_ee(model, ep["observation_state"])
+    result = compute_obs_ee(model, ep["observation_state"], rotation=rotation)
+    pose_names = ee_pose_names(rotation)
 
     obs = ep["observation_state"]
     rows = {
@@ -38,8 +39,8 @@ def convert_episode(repo_id: str, episode_index: int, out_path: Path) -> None:
         **{f"obs_lj{j}": obs[:, j] for j in range(7)},
         **{f"obs_rj{j}": obs[:, 7 + j] for j in range(7)},
         "obs_lift": obs[:, 14],
-        **{f"obs_left_ee_{name}": result["left_ee"][:, k] for k, name in enumerate(EE_POSE_NAMES)},
-        **{f"obs_right_ee_{name}": result["right_ee"][:, k] for k, name in enumerate(EE_POSE_NAMES)},
+        **{f"obs_left_ee_{name}": result["left_ee"][:, k] for k, name in enumerate(pose_names)},
+        **{f"obs_right_ee_{name}": result["right_ee"][:, k] for k, name in enumerate(pose_names)},
     }
     out_df = pd.DataFrame(rows)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -51,11 +52,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--repo-id", type=str, default=REPO_ID_DEFAULT)
+    parser.add_argument("--rotation", choices=["quat", "rotmat6"], default="quat")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
     out_path = args.out or Path(__file__).resolve().parent.parent / "output" / f"episode_{args.episode:06d}_obs_ee.parquet"
-    convert_episode(args.repo_id, args.episode, out_path)
+    convert_episode(args.repo_id, args.episode, out_path, args.rotation)
 
 
 if __name__ == "__main__":

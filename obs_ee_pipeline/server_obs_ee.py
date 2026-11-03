@@ -45,8 +45,8 @@ TOTAL_EPISODES = _META.total_episodes
 
 _model = load_model()
 
-# Same arm-prefixed flattening for both source dict order (EE_POSE_NAMES =
-# qw,qx,qy,qz,x,y,z) so the frontend can key straight into a flat dict, same
+# Same arm-prefixed flattening for both source dict order (EE_POSE_NAMES_QUAT
+# = qw,qx,qy,qz,x,y,z) so the frontend can key straight into a flat dict, same
 # pattern as server.py's JOINT_LABELS.
 _ARM_LABELS = {
     "left": [f"left_{n}" for n in ["qw", "qx", "qy", "qz", "x", "y", "z"]],

@@ -1,9 +1,11 @@
-"""Regenerate the entire adityx23/icl-dataset locally, in the same LeRobot
-v2.1 layout, with two new columns added to every episode's parquet:
+"""Regenerate an adityx23 lerobot-format dataset locally, in the same
+LeRobot v2.1 layout, with two new columns added to every episode's parquet:
 `observation.left_ee` / `observation.right_ee` -- the FK counterpart of
 generate_full_dataset.py's `action.q_target`, computed from the recorded
 `observation.state` (real joint encoders) via ik_pipeline.compute_obs_ee
-(see vr_teleop_ik.md §9).
+(see vr_teleop_ik.md §9). Orientation is written as either a quaternion
+(default) or the first-two-rows-of-the-rotation-matrix 6D representation --
+see --rotation / ik_pipeline.ee_pose_names.
 
 Everything else is carried through unchanged: every existing parquet column,
 meta/tasks.jsonl, meta/episodes.jsonl verbatim, and meta/episodes_stats.jsonl
@@ -27,6 +29,7 @@ Usage:
     python generate_obs_ee_dataset.py --merge-stats --num-shards 6      # combine after all shards finish
     python generate_obs_ee_dataset.py --start 0 --end 50                # contiguous slice, for testing
     python generate_obs_ee_dataset.py --out output/icl-dataset-obs-ee
+    python generate_obs_ee_dataset.py --repo-id adityx23/icl-demo-dataset --rotation rotmat6 --out output/icl-demo-dataset-obs-ee
 """
 
 import argparse
@@ -40,14 +43,14 @@ import pandas as pd
 from huggingface_hub import hf_hub_download
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from common.ik_pipeline import EE_POSE_NAMES, HUB_REVISION, REPO_ID_DEFAULT, compute_obs_ee, get_metadata, load_model
+from common.ik_pipeline import HUB_REVISION, REPO_ID_DEFAULT, compute_obs_ee, ee_pose_names, get_metadata, load_model
 
 
 def _download_meta_file(repo_id: str, rel_path: str) -> Path:
     return Path(hf_hub_download(repo_id, rel_path, repo_type="dataset", revision=HUB_REVISION))
 
 
-def _prepare_meta(repo_id: str, out_dir: Path) -> dict:
+def _prepare_meta(repo_id: str, out_dir: Path, rotation: str) -> dict:
     """Writes the meta files that carry over unchanged (idempotent -- safe to
     call from multiple concurrently-started shards since every shard writes
     identical bytes; only the per-shard stats need real merge handling, see
@@ -62,13 +65,14 @@ def _prepare_meta(repo_id: str, out_dir: Path) -> dict:
             src = _download_meta_file(repo_id, name)
             dest.write_bytes(src.read_bytes())
 
+    pose_names = ee_pose_names(rotation)
     info_path = _download_meta_file(repo_id, "meta/info.json")
     info = json.loads(info_path.read_text())
     for key in ("observation.left_ee", "observation.right_ee"):
         info["features"][key] = {
             "dtype": "float32",
-            "shape": [7],
-            "names": EE_POSE_NAMES,
+            "shape": [len(pose_names)],
+            "names": pose_names,
         }
     return info
 
@@ -85,7 +89,7 @@ def _stats_for(arr: np.ndarray) -> dict:
     }
 
 
-def generate(repo_id: str, out_dir: Path, episodes: list[int], shard_label: str) -> None:
+def generate(repo_id: str, out_dir: Path, episodes: list[int], shard_label: str, rotation: str) -> None:
     """Regenerates just this shard's `episodes` (any subset -- modulo-sharded,
     contiguous, or a single index). Writes each episode's parquet directly
     (no cross-shard overlap) and this shard's stats as
@@ -94,7 +98,7 @@ def generate(repo_id: str, out_dir: Path, episodes: list[int], shard_label: str)
     meta = get_metadata(repo_id)
     chunks_size = meta.chunks_size
     model = load_model()
-    _prepare_meta(repo_id, out_dir)
+    _prepare_meta(repo_id, out_dir, rotation)
 
     total = len(episodes)
     t0 = time.time()
@@ -108,7 +112,7 @@ def generate(repo_id: str, out_dir: Path, episodes: list[int], shard_label: str)
         df = pd.read_parquet(src_parquet)
 
         obs = np.stack(df["observation.state"].to_numpy()).astype(float)
-        result = compute_obs_ee(model, obs)
+        result = compute_obs_ee(model, obs, rotation=rotation)
         left_ee = result["left_ee"].astype(np.float32)
         right_ee = result["right_ee"].astype(np.float32)
         df["observation.left_ee"] = list(left_ee)
@@ -142,11 +146,11 @@ def generate(repo_id: str, out_dir: Path, episodes: list[int], shard_label: str)
     print(f"[shard {shard_label}] {total_frames} frames FK'd.")
 
 
-def merge_stats(repo_id: str, out_dir: Path) -> None:
+def merge_stats(repo_id: str, out_dir: Path, rotation: str) -> None:
     """Combines every meta/episodes_stats.partial.*.jsonl shard output with
     the untouched source stats into the final meta/episodes_stats.jsonl, and
     writes the final meta/info.json. Run once after all shards finish."""
-    info = _prepare_meta(repo_id, out_dir)
+    info = _prepare_meta(repo_id, out_dir, rotation)
 
     stats_path = _download_meta_file(repo_id, "meta/episodes_stats.jsonl")
     stats_lines = [json.loads(line) for line in stats_path.read_text().splitlines() if line.strip()]
@@ -186,6 +190,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-id", type=str, default=REPO_ID_DEFAULT)
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent.parent / "output" / "icl-dataset-obs-ee")
+    parser.add_argument("--rotation", choices=["quat", "rotmat6"], default="quat",
+                         help="orientation representation for observation.{left,right}_ee -- must match across all shards and --merge-stats for one output")
     parser.add_argument("--start", type=int, default=None)
     parser.add_argument("--end", type=int, default=None)
     parser.add_argument("--shard", type=int, default=None, help="process episodes where episode_index %% num_shards == shard")
@@ -194,7 +200,7 @@ def main():
     args = parser.parse_args()
 
     if args.merge_stats:
-        merge_stats(args.repo_id, args.out)
+        merge_stats(args.repo_id, args.out, args.rotation)
         return
 
     meta = get_metadata(args.repo_id)
@@ -209,7 +215,7 @@ def main():
         episodes = list(range(start, end))
         shard_label = f"{start}-{end}"
 
-    generate(args.repo_id, args.out, episodes, shard_label)
+    generate(args.repo_id, args.out, episodes, shard_label, args.rotation)
 
 
 if __name__ == "__main__":

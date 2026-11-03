@@ -222,10 +222,27 @@ def load_model() -> mujoco.MjModel:
 # action.right_ee's own feature schema in the source dataset exactly
 # (dtype=float32, shape=[7], names=[...]) so observation.left_ee /
 # observation.right_ee slot in as directly comparable columns.
-EE_POSE_NAMES = ["qw", "qx", "qy", "qz", "x", "y", "z"]
+EE_POSE_NAMES_QUAT = ["qw", "qx", "qy", "qz", "x", "y", "z"]
+
+# Continuous 6D rotation representation (Zhou et al., "On the Continuity of
+# Rotation Representations in Neural Networks", CVPR 2019): the first two
+# rows of the 3x3 rotation matrix, flattened -- unlike a quaternion this has
+# no +/-q double-cover ambiguity, so no hemisphere-continuity fix is needed
+# (see compute_obs_ee). "Rows" (not the paper's own first-two-columns
+# convention) to match this pipeline's mujoco/mink frame convention, and
+# mujoco's own row-major xmat layout.
+EE_POSE_NAMES_ROTMAT6 = ["r00", "r01", "r02", "r10", "r11", "r12", "x", "y", "z"]
 
 
-def compute_obs_ee(model: mujoco.MjModel, observation_state: np.ndarray) -> dict:
+def ee_pose_names(rotation: str) -> list[str]:
+    if rotation == "quat":
+        return EE_POSE_NAMES_QUAT
+    if rotation == "rotmat6":
+        return EE_POSE_NAMES_ROTMAT6
+    raise ValueError(f"unknown rotation representation: {rotation!r}")
+
+
+def compute_obs_ee(model: mujoco.MjModel, observation_state: np.ndarray, rotation: str = "quat") -> dict:
     """Forward-kinematics every frame's recorded observation.state (real
     joint encoders) through the MJCF (§9) to get each arm's end-effector
     pose -- the FK counterpart to compute_action_q's IK. observation_state
@@ -238,35 +255,51 @@ def compute_obs_ee(model: mujoco.MjModel, observation_state: np.ndarray) -> dict
     "Important caveat") -- see align_action_to_obs, immediately below
     _anchor_correction/_corrected_target further down this file.
 
-    observation_state: (N, 15) -> {"left_ee": (N, 7), "right_ee": (N, 7)},
-    each row qw,qx,qy,qz,x,y,z (matches EE_POSE_NAMES / action.{left,right}_ee's
-    own column convention)."""
+    rotation: "quat" (default, matches action.{left,right}_ee's own column
+    convention) or "rotmat6" (see EE_POSE_NAMES_ROTMAT6).
+
+    observation_state: (N, 15) -> {"left_ee": (N, D), "right_ee": (N, D)},
+    D=7 for "quat" (qw,qx,qy,qz,x,y,z) or D=9 for "rotmat6"
+    (r00,r01,r02,r10,r11,r12,x,y,z) -- see ee_pose_names(rotation)."""
+    if rotation not in ("quat", "rotmat6"):
+        raise ValueError(f"unknown rotation representation: {rotation!r}")
+
     n = observation_state.shape[0]
     configuration = mink.Configuration(model)
+    d = 7 if rotation == "quat" else 9
 
-    left_ee = np.zeros((n, 7))
-    right_ee = np.zeros((n, 7))
+    left_ee = np.zeros((n, d))
+    right_ee = np.zeros((n, d))
     for i in range(n):
         configuration.update(build_full_qpos(model, observation_state[i]))
         left_T = configuration.get_transform_frame_to_world("left_arm_ee", "site")
         right_T = configuration.get_transform_frame_to_world("right_arm_ee", "site")
-        left_ee[i, 0:4] = left_T.rotation().wxyz
-        left_ee[i, 4:7] = left_T.translation()
-        right_ee[i, 0:4] = right_T.rotation().wxyz
-        right_ee[i, 4:7] = right_T.translation()
+        if rotation == "quat":
+            left_ee[i, 0:4] = left_T.rotation().wxyz
+            right_ee[i, 0:4] = right_T.rotation().wxyz
+        else:
+            left_ee[i, 0:6] = left_T.rotation().as_matrix()[:2, :].reshape(6)
+            right_ee[i, 0:6] = right_T.rotation().as_matrix()[:2, :].reshape(6)
+        left_ee[i, -3:] = left_T.translation()
+        right_ee[i, -3:] = right_T.translation()
 
-    # The rotation-matrix -> quaternion conversion behind get_transform_frame_to_world
-    # (ultimately mujoco's mju_mat2Quat) picks *a* valid quaternion for each frame's
-    # matrix independently, with no guarantee of picking the same sign/hemisphere as
-    # the previous frame's -- quaternions doubly cover SO(3), so q and -q represent
-    # the identical rotation. A frame landing on the opposite hemisphere from its
-    # neighbor is a genuinely continuous rotation but reads as a sign-flip
-    # discontinuity in every raw component at once (observed directly: consecutive-
-    # frame dot product of exactly -1). This is purely a representation artifact of
-    # computing each frame independently, not a data glitch -- unlike
-    # _declitch_quaternions further down, which repairs actual bad recorded values.
-    left_ee[:, 0:4] = _enforce_quaternion_hemisphere(left_ee[:, 0:4])
-    right_ee[:, 0:4] = _enforce_quaternion_hemisphere(right_ee[:, 0:4])
+    if rotation == "quat":
+        # The rotation-matrix -> quaternion conversion behind get_transform_frame_to_world
+        # (ultimately mujoco's mju_mat2Quat) picks *a* valid quaternion for each frame's
+        # matrix independently, with no guarantee of picking the same sign/hemisphere as
+        # the previous frame's -- quaternions doubly cover SO(3), so q and -q represent
+        # the identical rotation. A frame landing on the opposite hemisphere from its
+        # neighbor is a genuinely continuous rotation but reads as a sign-flip
+        # discontinuity in every raw component at once (observed directly: consecutive-
+        # frame dot product of exactly -1). This is purely a representation artifact of
+        # computing each frame independently, not a data glitch -- unlike
+        # _declitch_quaternions further down, which repairs actual bad recorded values.
+        left_ee[:, 0:4] = _enforce_quaternion_hemisphere(left_ee[:, 0:4])
+        right_ee[:, 0:4] = _enforce_quaternion_hemisphere(right_ee[:, 0:4])
+    # rotation == "rotmat6": no hemisphere/sign ambiguity to fix -- unlike a
+    # quaternion, a rotation matrix represents each rotation uniquely, so
+    # independently computing every frame can't introduce a
+    # representation-only discontinuity the way it does for quat above.
 
     return {"left_ee": left_ee, "right_ee": right_ee}
 
